@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
@@ -2526,6 +2527,105 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
+}
+
+// RequestCopilotToken initiates GitHub Device Code Flow for Copilot and returns the
+// verification URL and session state. A background goroutine polls for user authorization,
+// exchanges the GitHub token for a Copilot token, and persists the credential.
+func (h *Handler) RequestCopilotToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	fmt.Println("Initializing GitHub Copilot authentication...")
+
+	state := fmt.Sprintf("cpl-%d", time.Now().UnixNano())
+	authSvc := copilotauth.NewCopilotAuth(h.cfg)
+
+	dc, err := authSvc.RequestDeviceCode(ctx)
+	if err != nil {
+		log.Errorf("copilot: failed to request device code: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate device flow"})
+		return
+	}
+
+	authURL := dc.VerificationURIComplete
+	if authURL == "" {
+		authURL = dc.VerificationURI
+	}
+
+	RegisterOAuthSession(state, "copilot")
+
+	go func() {
+		fmt.Printf("Visit %s and enter code: %s\n", dc.VerificationURI, dc.UserCode)
+		fmt.Println("Waiting for authentication...")
+
+		githubToken, errPoll := authSvc.PollForGithubToken(ctx, dc)
+		if errPoll != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", errPoll)
+			return
+		}
+
+		// Fetch GitHub user login for labelling.
+		login, errLogin := authSvc.FetchGithubUserLogin(ctx, githubToken)
+		if errLogin != nil {
+			log.Warnf("copilot: failed to fetch github user login: %v", errLogin)
+			login = fmt.Sprintf("%d", time.Now().UnixMilli())
+		}
+		if login == "" {
+			login = fmt.Sprintf("%d", time.Now().UnixMilli())
+		}
+
+		// Exchange GitHub token for short-lived Copilot token.
+		copilotTokenData, errCopilot := authSvc.FetchCopilotToken(ctx, githubToken)
+		if errCopilot != nil {
+			log.Warnf("copilot: failed to fetch copilot token (will retry at runtime): %v", errCopilot)
+		}
+
+		tokenStorage := authSvc.CreateTokenStorage(githubToken, login, copilotTokenData)
+		fileName := fmt.Sprintf("copilot-%s.json", strings.ReplaceAll(login, " ", "_"))
+
+		metadata := map[string]any{
+			"type":         "copilot",
+			"github_token": githubToken,
+			"login":        login,
+			"email":        login,
+		}
+		if copilotTokenData != nil {
+			metadata["copilot_token"] = copilotTokenData.Token
+			if copilotTokenData.ExpiresAt > 0 {
+				metadata["copilot_token_expiry"] = time.Unix(copilotTokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
+				metadata["expires_at"] = copilotTokenData.ExpiresAt
+			}
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "copilot",
+			FileName: fileName,
+			Label:    login,
+			Storage:  tokenStorage,
+			Metadata: metadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			log.Errorf("copilot: failed to save authentication tokens: %v", errSave)
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		fmt.Println("You can now use GitHub Copilot services through this CLI")
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("copilot")
+	}()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"url":    authURL,
+		"state":  state,
+		"code":   dc.UserCode,
+	})
 }
 
 // PopulateAuthContext extracts request info and adds it to the context
